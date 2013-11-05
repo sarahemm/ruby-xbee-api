@@ -12,41 +12,88 @@ end
 class ATCommandError < IOError
 end
 
+class ATCommandInvalidError < ATCommandError
+end
+
+class ATCommandParameterInvalidError < ATCommandError
+end
+
+class ATCommandTxFailureError < ATCommandError
+end
+
 module XBee
   class Node
-    attr_accessor :serial, :identifier, :parent_addr, :type, :profile_id, :mfg_id
+    attr_accessor :node_address, :identifier, :parent_addr, :type, :profile_id, :mfg_id, :io_pin
+
+    def initialize(xbee, node_address)
+      @xbee = xbee
+      @node_address = node_address
+      
+      @io_pin = []
+      (0..12).each do |pin|
+        @io_pin[pin] = XBee::IOPin.new xbee, pin, self
+      end
+    end
+    
+    def at_command(cmd, args = [])
+      @xbee.remote_at_command @node_address, cmd, args
+    end
+  end
+  
+  class ATResponse
+    attr_accessor :source_address, :source_net_address, :response
   end
   
   class IOPin
-    def initialize(xbee, pin_nbr)
+    def initialize(xbee, pin_nbr, node = nil)
       @xbee = xbee
       @pin_nbr = pin_nbr
+      @node = node ? node : xbee
     end
     
     def value?
-      io_sample = @xbee.at_command 'IS' # sample IO pins
-      raise IOPinDisabledError if io_sample.length < 2
-      enabled_dio = io_sample[1..2].unpack("B16")[0].reverse
-      #enabled_aio = io_sample[3].unpack("B8")[0].reverse
-      raise IOPinDisabledError if enabled_dio[@pin_nbr] == '0'
-      dio_values = io_sample[4..5].unpack("B16")[0].reverse
-      return dio_values[@pin_nbr].to_i
+      io_sample = @node.at_command 'IS' # sample IO pins
+      response = io_sample.response
+      raise IOPinDisabledError if response.length < 2
+      enabled_dio = response[1..2].unpack("B16")[0].reverse
+      enabled_aio = response[3].unpack("B8")[0].reverse
+      response.each_byte {|byte| print "0x#{byte.ord.to_s(16)} "}
+      if(enabled_dio[@pin_nbr] == '1') then
+        # pin is a digital input
+        dio_values = response[4..5].unpack("B16")[0].reverse
+        return dio_values[@pin_nbr].to_i
+      elsif(enabled_aio[@pin_nbr] == '1') then
+        # pin is an analog input
+        analog_start = enabled_dio.include?("1") ? 6 : 4
+        puts "Reading bytes starting at #{analog_start+@pin_nbr*2}"
+        return response[(analog_start+@pin_nbr*2)+1].ord | (response[analog_start+@pin_nbr*2].ord << 8)
+      else
+        # pin is disabled
+        raise IOPinDisabledError
+      end
     end
     
-    def digital_in!
-      cmd = ""
-      case @pin_nbr
+    def pin_to_cmd(pin_nbr)
+      case pin_nbr
         when 0..7
-          cmd = "D#{@pin_nbr}"
+          "D#{@pin_nbr}"
         when 10
-          cmd = "P0"
+          "P0"
         when 11
-          cmd = "P1"
+          "P1"
         when 12
-          cmd = "P2"
+          "P2"
       end
-      @xbee.at_command cmd, [0x03]
-      @xbee.at_command "AC" # apply changes
+    end
+
+    def digital_in!
+      @node.at_command pin_to_cmd(@pin_nbr), [0x03]  # monitored digital input
+      @node.at_command "AC" # apply changes
+    end
+    
+    def analog_in!
+      @node.at_command pin_to_cmd(@pin_nbr), [0x02]  # single-ended analog input
+      @node.at_command "AC" #apply changes
     end
   end
   
@@ -59,6 +106,7 @@ module XBee
       (0..12).each do |pin|
         @io_pin[pin] = XBee::IOPin.new self, pin
       end
+      @nodes = Hash.new
     end
     
     def send_packet(data)
@@ -84,15 +132,46 @@ module XBee
     
     def get_at_response
       response = get_response[4..-1]  # trim the frame identifier and command itself off
-      status = response[0].to_i
-      raise ATCommandError if status != 0x00
+      #response.each_byte {|byte| print "0x#{byte.ord.to_s(16)}[#{byte.chr}] "}
+      status = response[0].ord.to_i
+      check_status status
       response[1..-1]
     end
     
+    def get_remote_at_response
+      response = get_response[2..-1]  # trim the frame identifier and type off
+      (source_addr, source_net_addr, at_cmd, status, data) = response.unpack("Q>na2Ca*")
+      #response.each_byte {|byte| print "0x#{byte.ord.to_s(16)}[#{byte.chr}] "}
+      check_status status
+      at_cmd = at_cmd # TODO: either use this or don't collect it
+      respobj = XBee::ATResponse.new
+      respobj.source_address = source_addr
+      respobj.source_net_address = source_net_addr
+      respobj.response = data
+      respobj
+    end
+    
+    def check_status(status)
+      case status
+        when 0x01
+          raise ATCommandError
+        when 0x02
+          raise ATCommandInvalidError
+        when 0x03
+          raise ATCommandParameterInvalidError
+        when 0x04
+          raise ATCommandTxFailureError
+      end
+    end
+    
+    def node(node_address)
+      return @nodes[node_address] if @nodes[node_address]
+      @nodes[node_address] = XBee::Node.new self, node_address
+    end
+    
     def parse_node_response(response)
-      (serial, identifier, parent_addr, type, profile_id, mfg_id) = response.unpack("xxQZ*nxnn")
-      node = XBee::Node.new
-      node.serial = serial
+      (node_address, identifier, parent_addr, type, profile_id, mfg_id) = response.unpack("xxQ>Z*nCxnn")
+      node = XBee::Node.new(self, node_address)
       node.identifier = identifier
       node.parent_addr = parent_addr == 0xFFFE ? nil : parent_addr  # 0xFFFE = "no parent"
       node.type = case type
@@ -109,11 +188,32 @@ module XBee
     end
     
     def at_command(at_cmd, args = [])
-      cmd_pkt = [0x08, 0x01]
+      cmd_pkt = [0x08, 0x01]  # type: local AT command, frame ID: 1
       at_cmd.each_byte {|byte| cmd_pkt.push byte}
       cmd_pkt.push args
       send_packet cmd_pkt.flatten
-      get_at_response
+      respobj = XBee::ATResponse.new
+      respobj.response = get_at_response
+      respobj
+    end
+    
+    def remote_at_command(remote_serial, at_cmd, args = [])
+      cmd_pkt = [0x17, 0x01]  # type: remote AT command, frame ID: 1
+      cmd_pkt.push remote_serial >> 56 & 0xFF  # FIXME: must be an easier way...
+      cmd_pkt.push remote_serial >> 48 & 0xFF
+      cmd_pkt.push remote_serial >> 40 & 0xFF
+      cmd_pkt.push remote_serial >> 32 & 0xFF
+      cmd_pkt.push remote_serial >> 24 & 0xFF
+      cmd_pkt.push remote_serial >> 16 & 0xFF
+      cmd_pkt.push remote_serial >> 8 & 0xFF
+      cmd_pkt.push remote_serial >> 0 & 0xFF
+      cmd_pkt.push 0xFF # FIXME: support specifying network addresses
+      cmd_pkt.push 0xFE # FIXME: --^
+      cmd_pkt.push 0x00
+      at_cmd.each_byte {|byte| cmd_pkt.push byte}
+      cmd_pkt.push args
+      send_packet cmd_pkt.flatten
+      get_remote_at_response      
     end
     
     def node_identifier
@@ -132,7 +232,7 @@ module XBee
         response = parse_node_response(get_at_response)
         nodes.push response
       end
-      p nodes
+      nodes
     end
   end
 end
