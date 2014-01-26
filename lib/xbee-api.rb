@@ -44,6 +44,10 @@ module XBee
     attr_accessor :source_address, :source_net_address, :response
   end
   
+  class Packet
+    attr_accessor :source_address, :rssi, :pan_broadcast, :address_broadcast, :data
+  end
+  
   class IOPin
     def initialize(xbee, pin_nbr, node = nil)
       @xbee = xbee
@@ -117,8 +121,13 @@ module XBee
       #[ 0x7E, data.count, data.map {|b| b.kind_of?(String) ? b.ord : b}, checksum ].flatten.pack("CnC#{data.count}C").each_char {|b| print "0x#{b.ord.to_s(16)} "}
     end
     
-    def get_response
-      while(@port.read(1).ord != 0x7E) do
+    def get_response(start_byte = nil)
+      # if we're called from get_response_nonblock, the start byte has already been read/passed to us
+      # otherwise read it here
+      if(!start_byte) then
+        start_byte = @port.read(1)
+      end
+      while(start_byte.ord != 0x7E) do
         puts "Received junk data before start byte"
       end
       length = @port.read(2).unpack('n')[0]
@@ -128,6 +137,15 @@ module XBee
       checksum &= 0xFF
       raise ChecksumError if checksum != 0xFF
       return data
+    end
+
+    def get_response_nonblock
+      begin
+        start_byte = @port.read_nonblock(1)
+      rescue Errno::EAGAIN
+        return nil
+      end
+      get_response start_byte
     end
     
     def get_at_response
@@ -187,6 +205,18 @@ module XBee
       node
     end
     
+    def parse_rx_packet_response(response)
+      (frame_type, source_addr, rssi, options, data) = response.unpack("CQCCa*")
+      raise IOError if frame_type != 0x80
+      pkt = XBee::Packet.new
+      pkt.source_address = source_addr
+      pkt.rssi = rssi
+      pkt.pan_broadcast = (options & 0x4 == 0 ? false : true)
+      pkt.address_broadcast = (options & 0x2 == 0 ? false : true)
+      pkt.data = data
+      pkt
+    end
+    
     def at_command(at_cmd, args = [])
       cmd_pkt = [0x08, 0x01]  # type: local AT command, frame ID: 1
       at_cmd.each_byte {|byte| cmd_pkt.push byte}
@@ -221,18 +251,27 @@ module XBee
     end
     
     def node_discovery_timeout
-      (at_command('NT')[1].ord*100).to_i # FIXME: why is the first byte always 0?
+      (at_command('NT').response[1].ord*100).to_i # FIXME: why is the first byte always 0?
     end
     
     def nodes
       timeout = node_discovery_timeout
       nodes = []
-      nodes.push parse_node_response(at_command('ND'))
+      nodes.push parse_node_response(at_command('ND').response)
       while(IO.select([@port], [], [], timeout/1000) != nil)
         response = parse_node_response(get_at_response)
         nodes.push response
       end
       nodes
+    end
+    
+    def each_packet
+      while(true) do
+        response = get_response_nonblock
+        break if !response
+        packet = parse_rx_packet_response(response)
+        yield packet
+      end
     end
   end
 end
